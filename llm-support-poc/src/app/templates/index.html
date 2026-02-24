@@ -1,0 +1,200 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8"/>
+    <title>LLM Support POC + Agentic RAG</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+      .row { display: flex; gap: 16px; }
+      .col { flex: 1; }
+      .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+      .muted { color: #666; font-size: 13px; }
+      button { padding: 8px 12px; border-radius: 8px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
+      button:hover { background: #f6f6f6; }
+      textarea { width: 100%; min-height: 160px; padding: 10px; border-radius: 8px; border: 1px solid #ccc; }
+      .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; border: 1px solid #ccc; font-size: 12px; margin-left: 6px;}
+      .danger { border-color: #ffb3b3; background: #fff5f5; }
+      .ok { border-color: #b8e0c2; background: #f5fff7; }
+      pre { white-space: pre-wrap; }
+      a { color: inherit; }
+      details > summary { cursor: pointer; }
+    </style>
+  </head>
+  <body>
+    <h2>LLM Support POC <span class="pill">local</span> <span class="pill">agent</span> <span class="pill">RAG</span></h2>
+    <p class="muted">
+      Tickets → agent tool calls → grounded drafts → routing → human edits/approval → audit.
+      <a href="/docs" target="_blank">Open API docs</a>
+    </p>
+
+    <div class="card">
+      <button id="seedKbBtn">Seed invoices (KB)</button>
+      <button id="seedBtn">Seed 6 tickets</button>
+      <button id="refreshBtn">Refresh list</button>
+      <span class="muted" id="status"></span>
+    </div>
+
+    <div class="row">
+      <div class="col">
+        <h3>Tickets</h3>
+        <div id="tickets"></div>
+      </div>
+
+      <div class="col">
+        <h3>Details</h3>
+        <div id="detail" class="card muted">Select a ticket…</div>
+      </div>
+    </div>
+
+    <script>
+      const statusEl = document.getElementById("status");
+      const ticketsEl = document.getElementById("tickets");
+      const detailEl = document.getElementById("detail");
+
+      function setStatus(msg) { statusEl.textContent = msg; }
+
+      async function seedKB() {
+        setStatus("Seeding invoices into KB...");
+        const r = await fetch("/kb/seed_invoices", { method:"POST" });
+        const j = await r.json();
+        setStatus("KB seeded: " + j.created_ids.join(", "));
+      }
+
+      async function seedTickets() {
+        setStatus("Seeding tickets...");
+        const r = await fetch("/seed", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({count:6}) });
+        const j = await r.json();
+        setStatus("Tickets seeded: " + j.created_ids.join(", "));
+        await loadTickets();
+      }
+
+      async function loadTickets() {
+        const r = await fetch("/tickets");
+        const items = await r.json();
+        ticketsEl.innerHTML = "";
+        items.forEach(t => {
+          const div = document.createElement("div");
+          div.className = "card";
+          div.innerHTML = `
+            <div><b>#${t.id}</b> ${escapeHtml(t.subject)}</div>
+            <div class="muted">${escapeHtml(t.requester_email)} • ${escapeHtml(t.priority)} • ${escapeHtml(t.status)}</div>
+            <div style="margin-top:10px;">
+              <button onclick="selectTicket(${t.id})">Open</button>
+              <button onclick="generateDraft(${t.id})">Generate draft</button>
+            </div>
+          `;
+          ticketsEl.appendChild(div);
+        });
+      }
+
+      async function selectTicket(id) {
+        const r = await fetch(`/tickets/${id}`);
+        const d = await r.json();
+        renderDetail(d);
+      }
+
+      async function generateDraft(id) {
+        setStatus("Generating agent draft for #" + id + " ...");
+        await fetch(`/tickets/${id}/draft`, { method:"POST" });
+        setStatus("Draft generated for #" + id);
+        await selectTicket(id);
+      }
+
+      async function review(id, action) {
+        const edited = document.getElementById("editedReply")?.value || null;
+        const payload = { action, edited_reply: edited, reviewer: "agent" };
+        const r = await fetch(`/tickets/${id}/review`, {
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body: JSON.stringify(payload)
+        });
+        const j = await r.json();
+        setStatus("Review saved: " + j.action);
+        await selectTicket(id);
+        await loadTickets();
+      }
+
+      function renderDetail(data) {
+        const t = data.ticket;
+        const draft = data.latest_draft;
+        const decision = data.latest_decision;
+
+        let draftHtml = `<div class="muted">No draft yet. Click “Generate draft”.</div>`;
+        if (draft) {
+          const cls = draft.routing === "auto_send" ? "ok" : "danger";
+          const ragInfo = (draft.rag_sources && draft.rag_sources.length)
+            ? `<details><summary>RAG sources (${draft.rag_sources.length})</summary><pre>${escapeHtml(draft.rag_sources.join("\n"))}</pre><pre>${escapeHtml(draft.rag_context || "")}</pre></details>`
+            : `<div class="muted">RAG: no sources used.</div>`;
+
+          const traceInfo = (draft.agent_trace && draft.agent_trace.length)
+            ? `<details><summary>Agent trace (${draft.agent_trace.length} events)</summary><pre>${escapeHtml(JSON.stringify(draft.agent_trace, null, 2))}</pre></details>`
+            : `<div class="muted">Agent trace: none.</div>`;
+
+          draftHtml = `
+            <div class="card ${cls}">
+              <div><b>Draft</b>
+                <span class="pill">${draft.llm_provider}:${draft.llm_model}</span>
+                <span class="pill">${draft.routing}</span>
+                <span class="pill">risk=${draft.risk_score.toFixed(2)}</span>
+              </div>
+              <pre>${escapeHtml(draft.draft_reply)}</pre>
+              ${ragInfo}
+              ${traceInfo}
+            </div>
+          `;
+        }
+
+        let decisionHtml = `<div class="muted">No decision yet.</div>`;
+        if (decision) {
+          decisionHtml = `
+            <div class="card">
+              <div><b>Latest decision</b> <span class="pill">${escapeHtml(decision.action)}</span></div>
+              <div class="muted">reviewer=${escapeHtml(decision.reviewer)} • ${escapeHtml(decision.created_at)}</div>
+              <pre>${escapeHtml(decision.final_reply || "")}</pre>
+            </div>
+          `;
+        }
+
+        const reviewControls = draft ? `
+          <div class="card">
+            <div><b>Human review</b></div>
+            <div class="muted">Edit the reply if needed, then approve/send or reject.</div>
+            <textarea id="editedReply" placeholder="Optionally edit the reply...">${escapeHtml(draft.draft_reply)}</textarea>
+            <div style="margin-top:10px; display:flex; gap:10px;">
+              <button onclick="review(${t.id}, 'approve_and_send')">Approve & send</button>
+              <button onclick="review(${t.id}, 'edit_and_send')">Edit & send</button>
+              <button onclick="review(${t.id}, 'reject')">Reject</button>
+            </div>
+          </div>
+        ` : "";
+
+        detailEl.className = "card";
+        detailEl.innerHTML = `
+          <div><b>Ticket #${t.id}</b> <span class="pill">${escapeHtml(t.priority)}</span> <span class="pill">${escapeHtml(t.status)}</span></div>
+          <div class="muted">${escapeHtml(t.requester_email)} • ${escapeHtml(t.created_at)}</div>
+          <div style="margin-top:10px;"><b>${escapeHtml(t.subject)}</b></div>
+          <pre>${escapeHtml(t.body)}</pre>
+
+          ${draftHtml}
+          ${reviewControls}
+          ${decisionHtml}
+        `;
+      }
+
+      function escapeHtml(str) {
+        return (str ?? "").toString()
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#039;");
+      }
+
+      document.getElementById("seedKbBtn").addEventListener("click", seedKB);
+      document.getElementById("seedBtn").addEventListener("click", seedTickets);
+      document.getElementById("refreshBtn").addEventListener("click", loadTickets);
+
+      loadTickets();
+    </script>
+  </body>
+</html>
